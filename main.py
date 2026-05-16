@@ -8,7 +8,7 @@ from pathlib import Path
 # Set random seed
 np.random.seed(42)
 
-from currency_network.data import download_data, compute_log_returns, compute_volume_proxy, CURRENCIES
+from currency_network.data import download_data, compute_log_returns, compute_volume_proxy, CURRENCIES, NETWORK_CURRENCIES
 from currency_network.backtest import (
     run_rolling_backtest,
     compute_r2_per_currency,
@@ -20,7 +20,7 @@ from currency_network.backtest import (
     START_BACKTEST,
 )
 from currency_network.model import compute_displacement
-from currency_network.cnsi import compute_cnsi_series, analyze_crisis_episodes, detect_crisis_spikes, CRISIS_WINDOWS
+from currency_network.cnsi import compute_cnsi_series, analyze_crisis_episodes, detect_crisis_spikes, compute_detection_stats, CRISIS_WINDOWS
 from currency_network.gravity import compute_gravitational_pressure, rank_reserve_currencies
 from currency_network.pairs import backtest_pairs_sharpe
 from currency_network.report import (
@@ -31,6 +31,7 @@ from currency_network.report import (
     plot_gravity_ranking,
     plot_mode_decomposition,
     plot_pairs_pnl,
+    plot_crisis_detection_overview,
     print_report,
 )
 
@@ -41,12 +42,18 @@ def run_sensitivity_analysis(prices, log_returns, volume_proxy, calibrated_beta)
 
     for tau in [30, 60, 252]:
         for shrinkage in [True, False]:
-            # Run backtest with calibrated beta
-            backtest_res = run_rolling_backtest(prices, log_returns, volume_proxy, tau=tau, beta=calibrated_beta)
+            backtest_res = run_rolling_backtest(
+                prices, log_returns, volume_proxy, tau=tau, beta=calibrated_beta, shrinkage=shrinkage
+            )
 
             if len(backtest_res["u_star"]) > 0:
-                r2_dict, r2_scaled_dict = compute_r2_per_currency(backtest_res["u_star"], backtest_res["u_obs"], CURRENCIES[1:])
-                avg_r2 = np.mean(list(r2_dict.values()))
+                # Restrict R² to 2020-2024 OOS window
+                sens_dates = np.array(backtest_res["dates"])
+                sens_mask = sens_dates >= pd.Timestamp("2020-01-01")
+                _, r2_scaled_dict = compute_r2_per_currency(
+                    backtest_res["u_star"][sens_mask], backtest_res["u_obs"][sens_mask], NETWORK_CURRENCIES
+                )
+                avg_r2 = np.mean(list(r2_scaled_dict.values()))
 
                 method = "LW" if shrinkage else "sample"
                 baseline = "[BASELINE]" if tau == 60 and shrinkage else ""
@@ -63,11 +70,15 @@ def run_sensitivity_analysis(prices, log_returns, volume_proxy, calibrated_beta)
 
     # Alternative beta combinations
     for beta_tuple in [(0.333, 0.333, 0.334), (0.70, 0.20, 0.10)]:
-        backtest_res = run_rolling_backtest(prices, log_returns, volume_proxy, tau=60, beta=beta_tuple)
+        backtest_res = run_rolling_backtest(prices, log_returns, volume_proxy, tau=60, beta=beta_tuple, shrinkage=True)
 
         if len(backtest_res["u_star"]) > 0:
-            r2_dict, r2_scaled_dict = compute_r2_per_currency(backtest_res["u_star"], backtest_res["u_obs"], CURRENCIES[1:])
-            avg_r2 = np.mean(list(r2_dict.values()))
+            sens_dates = np.array(backtest_res["dates"])
+            sens_mask = sens_dates >= pd.Timestamp("2020-01-01")
+            _, r2_scaled_dict = compute_r2_per_currency(
+                backtest_res["u_star"][sens_mask], backtest_res["u_obs"][sens_mask], NETWORK_CURRENCIES
+            )
+            avg_r2 = np.mean(list(r2_scaled_dict.values()))
 
             beta_name = "equal beta" if beta_tuple == (0.333, 0.333, 0.334) else "volume-only beta"
 
@@ -148,30 +159,42 @@ def main():
     # 5. Compute benchmarks
     print("\n[5/8] Running AR(1) and PCA benchmarks...")
 
-    # Get in-sample u_obs for PCA training
-    displacement_all = compute_displacement(log_returns, TAU)
-    mask_is = displacement_all.index < "2020-01-01"
-    mask_oos = (displacement_all.index >= START_BACKTEST) & (displacement_all.index <= "2024-12-31")
+    # Backtest runs 2018-2024 (for CNSI history); R² is evaluated on 2020-2024 only.
+    displacement_net = compute_displacement(log_returns.iloc[:, 1:], TAU)
 
-    u_obs_is = displacement_all[mask_is].dropna().values
-    u_obs_oos = displacement_all[mask_oos].dropna().values[: len(backtest_results["u_star"])]
+    # Masks for in-sample (2015-2019) and OOS R² evaluation (2020-2024)
+    mask_is  = displacement_net.index < "2020-01-01"
+    mask_r2  = displacement_net.index >= "2020-01-01"  # OOS evaluation window
 
-    # Diagnostic output: check that u_star and f are nonzero
+    u_obs_is = displacement_net[mask_is].dropna().values  # PCA training set
+
+    # Align backtest results with 2020+ dates for R² evaluation
+    bt_dates = np.array(backtest_results["dates"])
+    r2_mask  = bt_dates >= pd.Timestamp("2020-01-01")
+    u_star_r2 = backtest_results["u_star"][r2_mask]   # (N_r2_dates, 9)
+    u_obs_r2  = backtest_results["u_obs"][r2_mask]    # (N_r2_dates, 9)
+
+    # Full arrays (2018-2024) kept for CNSI/crisis analysis
+    u_star_full = backtest_results["u_star"]
+    u_obs_full  = backtest_results["u_obs"]
+
+    # Displacement for PCA test set (aligned to R² mask dates)
+    u_obs_oos = displacement_net[mask_r2].dropna().values[:len(u_star_r2)]
+
+    # Diagnostic output
     print("\n     --- DIAGNOSTICS ---")
-    print(f"     u_star sample (first 5 dates, all currencies):")
-    print(f"     {backtest_results['u_star'][:5]}")
-    print(f"     u_star std per currency: {backtest_results['u_star'].std(axis=0)}")
-    print(f"     u_obs std per currency: {backtest_results['u_obs'].std(axis=0)}")
-    print(f"     f_series sample (first 5 dates):")
-    print(f"     {backtest_results['f_series'][:5]}")
-    print(f"     f_series std per currency: {backtest_results['f_series'].std(axis=0)}")
+    print(f"     Backtest dates: {bt_dates[0].date()} to {bt_dates[-1].date()} ({len(bt_dates)} days)")
+    print(f"     R² eval dates: {bt_dates[r2_mask][0].date()} to {bt_dates[r2_mask][-1].date()} ({r2_mask.sum()} days)")
+    print(f"     u_star std (2020-2024): {u_star_r2.std(axis=0).round(6)}")
+    print(f"     u_obs  std (2020-2024): {u_obs_r2.std(axis=0).round(6)}")
+    print(f"     Fiedler mean/min/max: {backtest_results['fiedler'].mean():.4f} / {backtest_results['fiedler'].min():.4f} / {backtest_results['fiedler'].max():.4f}")
     print()
 
-    # Compute R² (both raw and scaled) and correlation
-    r2_cn, r2_cn_scaled = compute_r2_per_currency(backtest_results["u_star"], backtest_results["u_obs"], CURRENCIES)
-    corr_cn, pval_cn = compute_predictive_correlation(backtest_results["u_star"], backtest_results["u_obs"], CURRENCIES)
-    r2_ar1 = ar1_benchmark(backtest_results["u_obs"], CURRENCIES)
-    r2_pca = pca_benchmark(u_obs_is, backtest_results["u_obs"], CURRENCIES, n_components=3)
+    # Compute R² on 2020-2024 out-of-sample window only
+    r2_cn, r2_cn_scaled = compute_r2_per_currency(u_star_r2, u_obs_r2, NETWORK_CURRENCIES)
+    corr_cn, pval_cn = compute_predictive_correlation(u_star_r2, u_obs_r2, NETWORK_CURRENCIES)
+    r2_ar1 = ar1_benchmark(u_obs_r2, NETWORK_CURRENCIES)
+    r2_pca = pca_benchmark(u_obs_is, u_obs_oos, NETWORK_CURRENCIES, n_components=3)
 
     print(f"     CN avg R² (raw): {np.mean(list(r2_cn.values())):.3f}")
     print(f"     CN avg R² (scaled): {np.mean(list(r2_cn_scaled.values())):.3f}")
@@ -181,21 +204,18 @@ def main():
     # 6. Gravity and reserve currency ranking
     print("\n[6/8] Computing gravitational pressure...")
 
-    # Use last available Laplacian for gravity
+    # Recover K from last 9x9 Laplacian
     L_last = backtest_results["L_series"][-1]
     K_last = np.abs(L_last - np.diag(np.diag(L_last)))
-    K_last = np.diag(np.diag(L_last)) - L_last  # recover K from L
 
-    # Estimate mass from last window
-    window_idx = len(log_returns) - TAU
-    log_ret_window = log_returns.iloc[-TAU:].values
-    vol_window = volume_proxy.iloc[-TAU:].values
+    # Mass from last window (9 non-USD currencies)
     from currency_network.model import compute_mass
-
+    log_ret_window = log_returns.iloc[-TAU:, 1:].values   # (tau, 9)
+    vol_window = volume_proxy.iloc[-TAU:, 1:].values       # (tau, 9)
     mass_last = compute_mass(log_ret_window, vol_window, beta=calibrated_beta)
 
     P_grav = compute_gravitational_pressure(K_last, mass_last, G0_normalize=True)
-    gravity_rankings, reserve_currencies = rank_reserve_currencies(P_grav, CURRENCIES, theta=2.0)
+    gravity_rankings, reserve_currencies = rank_reserve_currencies(P_grav, NETWORK_CURRENCIES, theta=2.0)
 
     # 7. CNSI and crisis analysis
     print("\n[7/8] Analyzing CNSI and crisis episodes...")
@@ -207,14 +227,18 @@ def main():
         cnsi_z, backtest_results["fiedler"], np.array(backtest_results["dates"])
     )
 
+    detection_stats = compute_detection_stats(
+        cnsi_z, backtest_results["fiedler"], np.array(backtest_results["dates"])
+    )
+
     # 8. Pairs trading
     print("\n[8/8] Backtesting pairs trading strategy...")
 
     cn_sharpe, naive_sharpe, cn_pnl, naive_pnl = backtest_pairs_sharpe(
         backtest_results["u_obs"],
         backtest_results["u_star"],
-        log_returns.iloc[: len(backtest_results["u_obs"])],
-        CURRENCIES,
+        log_returns.iloc[: len(backtest_results["u_obs"]), 1:],  # 9 non-USD columns
+        NETWORK_CURRENCIES,
         pair=("EUR", "GBP"),
     )
 
@@ -230,6 +254,8 @@ def main():
 
     save_tables(
         backtest_results,
+        cnsi_series,
+        cnsi_z,
         calibration_mse,
         calibrated_beta,
         r2_cn,
@@ -238,17 +264,19 @@ def main():
         r2_pca,
         gravity_rankings,
         crisis_analysis,
+        detection_stats,
         cn_sharpe,
         naive_sharpe,
         sensitivity_results,
-        CURRENCIES,
+        NETWORK_CURRENCIES,
     )
 
     plot_fiedler_timeseries(backtest_results, CRISIS_WINDOWS)
-    plot_cnsi_timeseries(backtest_results, CRISIS_WINDOWS)
-    plot_r2_comparison(r2_cn, r2_ar1, r2_pca, CURRENCIES)
+    plot_cnsi_timeseries(cnsi_series, cnsi_z, np.array(backtest_results["dates"]), CRISIS_WINDOWS)
+    plot_crisis_detection_overview(cnsi_z, backtest_results["fiedler"], np.array(backtest_results["dates"]), detection_stats)
+    plot_r2_comparison(r2_cn, r2_ar1, r2_pca, NETWORK_CURRENCIES)
     plot_gravity_ranking(gravity_rankings)
-    plot_mode_decomposition(backtest_results["L_series"][-1], CURRENCIES)
+    plot_mode_decomposition(backtest_results["L_series"][-1], NETWORK_CURRENCIES)
     plot_pairs_pnl(cn_pnl, naive_pnl, np.array(backtest_results["dates"]))
 
     # Print full report
@@ -264,11 +292,12 @@ def main():
         gravity_rankings,
         reserve_currencies,
         crisis_analysis,
+        detection_stats,
         cn_sharpe,
         naive_sharpe,
         sensitivity_results,
         displacement_bound,
-        CURRENCIES,
+        NETWORK_CURRENCIES,
     )
 
     print("\n[OK] All results saved to currency_network/results/")

@@ -1,6 +1,7 @@
 """Core mathematical models: Laplacian, mass, equilibrium."""
 
 import numpy as np
+from scipy.linalg import pinv as scipy_pinv
 from sklearn.covariance import LedoitWolf
 
 
@@ -84,7 +85,7 @@ def compute_mass(log_returns_window, volume_window, beta=(0.5, 0.3, 0.2)):
 
 def compute_equilibrium(L, f):
     """Compute equilibrium displacement u* = L_pinv @ f."""
-    L_plus = np.linalg.pinv(L)
+    L_plus = scipy_pinv(L)
     u_star = L_plus @ f
     return u_star, L_plus
 

@@ -11,6 +11,8 @@ sns.set_style("whitegrid")
 
 def save_tables(
     backtest_results,
+    cnsi_series,
+    cnsi_z,
     calibration_mse,
     beta,
     r2_cn,
@@ -19,6 +21,7 @@ def save_tables(
     r2_pca,
     gravity_rankings,
     crisis_analysis,
+    detection_stats,
     cn_sharpe,
     naive_sharpe,
     sensitivity_results,
@@ -28,14 +31,14 @@ def save_tables(
     """Save all tables as CSV."""
     Path(results_dir).mkdir(parents=True, exist_ok=True)
 
-    # R² comparison (raw and scaled)
+    # R² comparison (raw and scaled) — currencies already excludes USD
     r2_df = pd.DataFrame(
         {
-            "Currency": currencies[1:],  # skip USD
-            "CN_R2_Raw": [r2_cn.get(c, 0) for c in currencies[1:]],
-            "CN_R2_Scaled": [r2_cn_scaled.get(c, 0) for c in currencies[1:]],
-            "PCA_R2": [r2_pca.get(c, 0) for c in currencies[1:]],
-            "AR1_R2": [r2_ar1.get(c, 0) for c in currencies[1:]],
+            "Currency": currencies,
+            "CN_R2_Raw": [r2_cn.get(c, 0) for c in currencies],
+            "CN_R2_Scaled": [r2_cn_scaled.get(c, 0) for c in currencies],
+            "PCA_R2": [r2_pca.get(c, 0) for c in currencies],
+            "AR1_R2": [r2_ar1.get(c, 0) for c in currencies],
         }
     )
     r2_df.to_csv(f"{results_dir}/r2_comparison.csv", index=False)
@@ -62,6 +65,19 @@ def save_tables(
     crisis_df = pd.DataFrame(crisis_df_list)
     crisis_df.to_csv(f"{results_dir}/crisis_analysis.csv", index=False)
 
+    # Detection stats
+    det_rows = []
+    for event, stats in detection_stats["per_crisis"].items():
+        det_rows.append({
+            "Event": event,
+            "Max_CNSI_Z": stats["max_z"],
+            "Detected": stats["detected"],
+            "Peak_Date": stats["peak_date"].strftime("%Y-%m-%d") if stats["peak_date"] else "",
+            "Fiedler_Lead_Weeks": stats["fiedler_lead_weeks"],
+        })
+    det_df = pd.DataFrame(det_rows)
+    det_df.to_csv(f"{results_dir}/crisis_detection_stats.csv", index=False)
+
     # Sensitivity analysis
     sens_df = pd.DataFrame(sensitivity_results)
     sens_df.to_csv(f"{results_dir}/sensitivity_analysis.csv", index=False)
@@ -70,31 +86,34 @@ def save_tables(
     cnsi_df = pd.DataFrame(
         {
             "Date": backtest_results["dates"],
+            "CNSI": cnsi_series,
+            "CNSI_Z": cnsi_z,
             "Fiedler": backtest_results["fiedler"],
         }
     )
     cnsi_df.to_csv(f"{results_dir}/cnsi_timeseries.csv", index=False)
 
 
-def plot_cnsi_timeseries(backtest_results, crisis_windows, results_dir="currency_network/results"):
-    """Plot CNSI z-score with crisis windows."""
-    dates = backtest_results["dates"]
-    fiedler = backtest_results["fiedler"]
+def plot_cnsi_timeseries(cnsi_series, cnsi_z, dates, crisis_windows, results_dir="currency_network/results"):
+    """Plot CNSI and its z-score with crisis windows."""
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
 
-    fig, ax = plt.subplots(figsize=(14, 6))
+    ax1.plot(dates, cnsi_series, linewidth=2, color="darkblue", label="CNSI")
+    ax1.set_ylabel("CNSI (elastic potential energy)", fontsize=12)
+    ax1.set_title("Currency Network Stress Index (CNSI)", fontsize=14, fontweight="bold")
 
-    ax.plot(dates, fiedler, linewidth=2, label="Fiedler Value")
-    ax.set_xlabel("Date", fontsize=12)
-    ax.set_ylabel("Fiedler Value", fontsize=12)
-    ax.set_title("Currency Network: Spectral Gap (Fiedler Value) Over Time", fontsize=14, fontweight="bold")
+    ax2.plot(dates, cnsi_z, linewidth=2, color="darkred", label="CNSI z-score")
+    ax2.axhline(2.5, color="orange", linestyle="--", linewidth=1, label="2.5σ threshold")
+    ax2.set_ylabel("CNSI z-score (trailing 252-day)", fontsize=12)
+    ax2.set_xlabel("Date", fontsize=12)
 
-    # Add crisis windows
     colors = ["red", "orange", "purple"]
-    for (crisis_name, (start, end)), color in zip(crisis_windows.items(), colors):
-        ax.axvspan(pd.Timestamp(start), pd.Timestamp(end), alpha=0.2, color=color, label=crisis_name)
+    for ax in [ax1, ax2]:
+        for (crisis_name, (start, end)), color in zip(crisis_windows.items(), colors):
+            ax.axvspan(pd.Timestamp(start), pd.Timestamp(end), alpha=0.2, color=color, label=crisis_name)
+        ax.legend(loc="best", fontsize=9)
+        ax.grid(True, alpha=0.3)
 
-    ax.legend(loc="best")
-    ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(f"{results_dir}/cnsi_timeseries.png", dpi=150)
     plt.close()
@@ -125,7 +144,7 @@ def plot_fiedler_timeseries(backtest_results, crisis_windows, results_dir="curre
 
 def plot_r2_comparison(r2_cn, r2_ar1, r2_pca, currencies, results_dir="currency_network/results"):
     """Plot R² comparison across methods."""
-    currencies_plot = currencies[1:]  # skip USD
+    currencies_plot = currencies  # USD already excluded by caller
 
     cn_vals = [r2_cn.get(c, 0) for c in currencies_plot]
     ar1_vals = [r2_ar1.get(c, 0) for c in currencies_plot]
@@ -201,6 +220,63 @@ def plot_mode_decomposition(L_last, currencies, results_dir="currency_network/re
     plt.close()
 
 
+def plot_crisis_detection_overview(cnsi_z, fiedler_series, dates, detection_stats, results_dir="currency_network/results"):
+    """Three-panel crisis detection overview: CNSI z-score, Fiedler, and per-event bar chart."""
+    from currency_network.cnsi import CRISIS_WINDOWS
+
+    colors = ["#d62728", "#ff7f0e", "#2ca02c", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22"]
+
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(16, 14), gridspec_kw={"height_ratios": [2, 2, 1]})
+
+    # Panel 1: CNSI z-score
+    ax1.plot(dates, cnsi_z, linewidth=1.5, color="darkred", label="CNSI z-score")
+    ax1.axhline(2.5, color="orange", linestyle="--", linewidth=1.2, label="2.5σ threshold")
+    ax1.fill_between(dates, 0, cnsi_z, where=cnsi_z > 2.5, color="red", alpha=0.3, label="Detected stress")
+    ax1.set_ylabel("CNSI z-score", fontsize=11)
+    ax1.set_title("Crisis Detection: CNSI and Fiedler Early Warning (2015–2024)", fontsize=13, fontweight="bold")
+
+    for (crisis_name, (start, end)), color in zip(CRISIS_WINDOWS.items(), colors):
+        ax1.axvspan(pd.Timestamp(start), pd.Timestamp(end), alpha=0.12, color=color)
+    ax1.legend(loc="upper left", fontsize=8)
+    ax1.grid(True, alpha=0.3)
+
+    # Panel 2: Fiedler value
+    ax2.plot(dates, fiedler_series, linewidth=1.5, color="darkblue", label="Fiedler value mu_2")
+    ax2.set_ylabel("Fiedler value δ(t)", fontsize=11)
+    ax2.set_xlabel("Date", fontsize=11)
+
+    for (crisis_name, (start, end)), color in zip(CRISIS_WINDOWS.items(), colors):
+        ax2.axvspan(pd.Timestamp(start), pd.Timestamp(end), alpha=0.12, color=color, label=crisis_name)
+    ax2.legend(loc="upper left", fontsize=7, ncol=2)
+    ax2.grid(True, alpha=0.3)
+
+    # Panel 3: Per-event max CNSI z-score bar chart
+    per_crisis = detection_stats["per_crisis"]
+    event_names = [k.split(" (")[0] for k in per_crisis.keys()]
+    max_zs = [v["max_z"] if not np.isnan(v["max_z"]) else 0.0 for v in per_crisis.values()]
+    bar_colors = ["#d62728" if z > 2.5 else ("#ff7f0e" if z > 1.5 else "#aec7e8") for z in max_zs]
+
+    bars = ax3.barh(event_names, max_zs, color=bar_colors, alpha=0.85)
+    ax3.axvline(2.5, color="orange", linestyle="--", linewidth=1.2, label="2.5σ threshold")
+    ax3.set_xlabel("Peak CNSI z-score within event window", fontsize=10)
+    ax3.set_title(
+        f"Per-Event Detection  |  Hit rate: {detection_stats['n_detected']}/{detection_stats['n_valid_windows']} "
+        f"({100*detection_stats['detection_rate']:.0f}%)  |  "
+        f"False positive rate: {100*detection_stats['fp_rate_daily']:.1f}%/day",
+        fontsize=10,
+    )
+    ax3.legend(fontsize=9)
+    ax3.grid(True, alpha=0.3, axis="x")
+
+    for bar, z in zip(bars, max_zs):
+        ax3.text(bar.get_width() + 0.05, bar.get_y() + bar.get_height() / 2,
+                 f"{z:.2f}σ", va="center", fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(f"{results_dir}/crisis_detection_overview.png", dpi=150)
+    plt.close()
+
+
 def plot_pairs_pnl(cn_pnl, naive_pnl, dates, results_dir="currency_network/results"):
     """Plot cumulative PnL of pairs strategies."""
     cn_cumulative = np.cumsum(cn_pnl)
@@ -238,6 +314,7 @@ def print_report(
     gravity_rankings,
     reserve_currencies,
     crisis_analysis,
+    detection_stats,
     cn_sharpe,
     naive_sharpe,
     sensitivity_results,
@@ -262,7 +339,7 @@ def print_report(
     )
     print("-" * 48)
 
-    currencies_subset = currencies[1:]  # skip USD
+    currencies_subset = currencies  # USD already excluded by caller
     r2_cn_list = []
     r2_cn_scaled_list = []
     r2_ar1_list = []
@@ -290,7 +367,7 @@ def print_report(
     print("-" * 30)
 
     for curr in currencies_subset:
-        cn_r2_scaled = r2_cn_scaled.get(curr, 0)
+        cn_r2_scaled = r2_cn_scaled.get(curr, 0.0)
         r2_cn_scaled_list.append(cn_r2_scaled)
         print(f"{curr:<12} | {cn_r2_scaled:15.3f}")
 
@@ -321,6 +398,38 @@ def print_report(
         )
         print(f"  Lead time (Fiedler to CNSI peak): {stats['lead_time']:.0f} weeks")
 
+    # Crisis detection statistics
+    print("\n--- CRISIS DETECTION STATISTICS (threshold = 2.5 s.d.) ---")
+    print(
+        f"{'Event':<35} | {'Max CNSI-Z':>10} | {'Detected':>8} | {'Fiedler Lead':>12}"
+    )
+    print("-" * 75)
+
+    per = detection_stats["per_crisis"]
+    for event, stats in per.items():
+        max_z = stats["max_z"]
+        detected = "YES" if stats["detected"] else "no"
+        lead = f"{stats['fiedler_lead_weeks']:.1f} wks" if stats["fiedler_lead_weeks"] else "—"
+        note = stats.get("note", "")
+        if np.isnan(max_z):
+            z_str = "  n/a (no history)"
+            detected = "—"
+        else:
+            z_str = f"{max_z:9.2f}sd"
+        print(f"{event:<35} | {z_str:>10} | {detected:>8} | {lead:>12}  {note}")
+
+    print("-" * 75)
+    print(
+        f"Hit rate:            {detection_stats['n_detected']}/{detection_stats['n_valid_windows']} events "
+        f"= {100 * detection_stats['detection_rate']:.0f}%"
+    )
+    print(
+        f"False positive rate: {detection_stats['fp_days']} days / {detection_stats['non_crisis_days']} non-crisis days "
+        f"= {100 * detection_stats['fp_rate_daily']:.2f}%/day"
+    )
+    if detection_stats["mean_fiedler_lead_weeks"] > 0:
+        print(f"Mean Fiedler lead time (detected events): {detection_stats['mean_fiedler_lead_weeks']:.1f} weeks")
+
     # Gravity rankings
     print("\n--- GRAVITATIONAL PRESSURE: RESERVE CURRENCY RANKING ---")
     print(f"{'Rank':<5} {'Currency':<12} {'G-Pressure Score':>18}")
@@ -335,11 +444,11 @@ def print_report(
     print(f"Naive Pairs Sharpe: {naive_sharpe:7.3f}")
 
     # Sensitivity analysis
-    print("\n--- SENSITIVITY ANALYSIS ---")
+    print("\n--- SENSITIVITY ANALYSIS (avg scaled R², OOS 2020-2024) ---")
     for row in sensitivity_results:
         print(
             f"tau={row['tau']:3d}, {row['method']:<6s}, "
-            f"{row['beta_type']:<20s}: avg R² = {row['avg_r2']:.3f}"
+            f"{row['beta_type']:<20s}: avg scaled R² = {row['avg_r2']:.3f}"
         )
 
     # Displacement bound check

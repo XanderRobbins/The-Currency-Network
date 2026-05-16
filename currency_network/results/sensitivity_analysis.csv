@@ -1,9 +1,9 @@
 tau,method,beta_type,avg_r2,baseline
-30,LW,calibrated,0.0,
-30,sample,calibrated,0.0,
-60,LW,calibrated,0.0,[BASELINE]
-60,sample,calibrated,0.0,
-252,LW,calibrated,0.0,
-252,sample,calibrated,0.0,
-60,LW,equal beta,0.0,
-60,LW,volume-only beta,0.0,
+30,LW,calibrated,0.009585833714077261,
+30,sample,calibrated,0.008633733035588922,
+60,LW,calibrated,0.015126810836364912,[BASELINE]
+60,sample,calibrated,0.010342667856371132,
+252,LW,calibrated,0.024636159010216502,
+252,sample,calibrated,0.012661112928494046,
+60,LW,equal beta,0.015126810836364912,
+60,LW,volume-only beta,0.015126810836364912,

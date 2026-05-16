@@ -18,6 +18,8 @@ TICKERS = {
 }
 
 CURRENCIES = ["USD", "EUR", "GBP", "JPY", "CHF", "AUD", "CAD", "NZD", "SEK", "NOK"]
+# USD is the numeraire — not a network node. All network computations use these 9 currencies.
+NETWORK_CURRENCIES = CURRENCIES[1:]
 
 INVERT_TICKERS = {"JPY", "CHF", "CAD", "SEK", "NOK"}
 

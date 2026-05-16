@@ -30,10 +30,10 @@ def backtest_pairs_sharpe(
     cn_signal = (u_obs[:, i] - u_obs[:, j]) - (u_star[:, i] - u_star[:, j])
     signal_std = np.std(cn_signal)
 
-    # Positions: +1 if signal > 1 std, -1 if signal < -1 std, 0 otherwise
+    # Per paper §8.2: large positive signal → i over-displaced → SHORT i / LONG j (position = -1)
     cn_position = np.zeros(len(cn_signal))
-    cn_position[cn_signal > signal_std] = 1
-    cn_position[cn_signal < -signal_std] = -1
+    cn_position[cn_signal > signal_std] = -1
+    cn_position[cn_signal < -signal_std] = 1
 
     # Compute daily PnL
     returns_i = log_returns.iloc[:, i].values[: len(cn_signal)]
